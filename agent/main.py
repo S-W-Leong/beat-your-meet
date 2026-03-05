@@ -481,9 +481,13 @@ class AgendaTimers:
         )
 
         if self._state.can_intervene():
-            await self._session.say(warning, allow_interruptions=True)
-            self._state.record_intervention()
-            logger.info("Time warning delivered for '%s'", item.topic)
+            try:
+                await self._session.say(warning, allow_interruptions=True)
+                self._state.record_intervention()
+                logger.info("Time warning delivered for '%s'", item.topic)
+            except RuntimeError:
+                logger.warning("Session closed — skipping time warning")
+                return
 
         await _send_agenda_state(self._room, self._state)
 
@@ -499,22 +503,26 @@ class AgendaTimers:
 
         next_item = self._state.advance_to_next()
 
-        if next_item:
-            transition = AGENDA_TRANSITION_TEMPLATE.format(
-                next_item=next_item.topic,
-                duration=int(next_item.duration_minutes),
-            )
-            await self._session.say(transition, allow_interruptions=True)
-            self._state.record_intervention()
-            # Start timers for the new item
-            self.start_item_timers()
-        else:
-            # No more items — wait for explicit host-driven UI end signal.
-            await self._session.say(
-                "That wraps up our agenda. Host, please click End Meeting when you're ready.",
-                allow_interruptions=True,
-            )
-            self._state.record_intervention()
+        try:
+            if next_item:
+                transition = AGENDA_TRANSITION_TEMPLATE.format(
+                    next_item=next_item.topic,
+                    duration=int(next_item.duration_minutes),
+                )
+                await self._session.say(transition, allow_interruptions=True)
+                self._state.record_intervention()
+                # Start timers for the new item
+                self.start_item_timers()
+            else:
+                # No more items — wait for explicit host-driven UI end signal.
+                await self._session.say(
+                    "That wraps up our agenda. Host, please click End Meeting when you're ready.",
+                    allow_interruptions=True,
+                )
+                self._state.record_intervention()
+        except RuntimeError:
+            logger.warning("Session closed — skipping overtime transition")
+            return
 
         # Summarise the completed item
         if completed_item:
@@ -1032,6 +1040,66 @@ async def _summarize_item(
     return ItemNotes(item_id=item.id, topic=item.topic)
 
 
+async def _chat_web_search(query: str) -> dict:
+    """Standalone web search for chat @beat mentions (reuses the DDG HTML approach)."""
+    try:
+        def _search_sync() -> list[dict]:
+            import html
+            from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+            from urllib.request import Request, urlopen
+
+            result_link_re = re.compile(
+                r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                re.IGNORECASE | re.DOTALL,
+            )
+            snippet_re = re.compile(
+                r'<(?:a|div)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
+                re.IGNORECASE | re.DOTALL,
+            )
+
+            def _clean(s: str) -> str:
+                s = re.sub(r"<[^>]+>", " ", s)
+                s = html.unescape(s)
+                return re.sub(r"\s+", " ", s).strip()
+
+            def _unwrap_ddg_url(href: str) -> str:
+                if href.startswith("//"):
+                    href = f"https:{href}"
+                parsed = urlparse(href)
+                if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+                    uddg = parse_qs(parsed.query).get("uddg", [None])[0]
+                    if uddg:
+                        return unquote(uddg)
+                return href
+
+            search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+            req = Request(search_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as resp:
+                page = resp.read().decode("utf-8", errors="ignore")
+
+            links = result_link_re.findall(page)
+            snippets = snippet_re.findall(page)
+            results: list[dict] = []
+            for i, (href, title_html) in enumerate(links[:5]):
+                snippet_html = snippets[i] if i < len(snippets) else ""
+                results.append(
+                    {
+                        "title": _clean(title_html),
+                        "snippet": _clean(snippet_html),
+                        "url": _unwrap_ddg_url(href),
+                    }
+                )
+            return results
+
+        results = await asyncio.to_thread(_search_sync)
+        if not results:
+            return {"results": [], "message": "No results found."}
+        return {"results": results}
+    except Exception as e:
+        logger.exception("_chat_web_search failed for query %r", query)
+        return {"results": [], "error": str(e)}
+
+
 async def _handle_chat_mention(
     room: rtc.Room,
     state: MeetingState,
@@ -1091,7 +1159,7 @@ async def _handle_chat_mention(
         await _reply("Got it — I'll prepare that document at the end of the meeting.")
         return
 
-    # General question → Mistral
+    # General question → Mistral with tool support
     item = state.current_item
     ctx_summary = (
         f"Meeting style: {state.style}. "
@@ -1101,27 +1169,163 @@ async def _handle_chat_mention(
         else f"Meeting style: {state.style}. No active agenda item."
     )
 
+    # Tool definitions for chat @beat responses
+    chat_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_participant_count",
+                "description": "Get the current number of participants in the meeting room.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_meeting_info",
+                "description": "Get current meeting status including timing and progress.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_agenda",
+                "description": "Get the full meeting agenda with all items and their status.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_meeting_notes",
+                "description": "Get notes and summaries from completed agenda items.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information, news, facts, or data.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query string."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+    ]
+
+    # Tool execution helpers
+    async def _exec_tool(name: str, args: dict) -> str:
+        if name == "get_participant_count":
+            participants = list(room.remote_participants.values())
+            result = {
+                "participant_count": len(participants),
+                "participants": [p.identity for p in participants],
+            }
+        elif name == "get_meeting_info":
+            result = {
+                "agenda_title": state.agenda_title,
+                "style": state.style,
+                "current_item": item.topic if item else None,
+                "current_item_elapsed_minutes": round(state.elapsed_minutes, 1),
+                "current_item_allocated_minutes": item.duration_minutes if item else 0,
+                "total_meeting_minutes": round(state.total_meeting_minutes, 1),
+                "items_completed": sum(1 for i in state.items if i.state == ItemState.COMPLETED),
+                "items_remaining": len(state.remaining_items),
+                "total_items": len(state.items),
+            }
+        elif name == "get_agenda":
+            result = {
+                "title": state.agenda_title,
+                "items": [
+                    {
+                        "topic": i.topic,
+                        "duration_minutes": i.duration_minutes,
+                        "state": i.state.value,
+                    }
+                    for i in state.items
+                ],
+            }
+        elif name == "get_meeting_notes":
+            result = {
+                "notes": [
+                    {
+                        "topic": n.topic,
+                        "key_points": n.key_points,
+                        "decisions": n.decisions,
+                        "action_items": n.action_items,
+                    }
+                    for n in state.meeting_notes
+                ],
+            }
+        elif name == "web_search":
+            query = args.get("query", "")
+            result = await _chat_web_search(query)
+        else:
+            result = {"error": f"Unknown tool: {name}"}
+        return json.dumps(result)
+
     try:
-        response = await client.chat.complete_async(
-            model="mistral-small-latest",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Beat, an AI meeting assistant replying in a text chat. "
-                        f"{ctx_summary} "
-                        "Be concise and helpful. 1–3 sentences max. Plain text only."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": question if question else "You were mentioned.",
-                },
-            ],
-            temperature=0.4,
-            max_tokens=200,
-        )
-        reply_text = response.choices[0].message.content.strip()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Beat, an AI meeting assistant replying in a text chat. "
+                    f"{ctx_summary} "
+                    "You have tools to look up meeting data and search the web. "
+                    "USE your tools when the question requires real data (participant counts, "
+                    "agenda info, web searches, etc.) instead of guessing. "
+                    "Be concise and helpful. 1–3 sentences max. Plain text only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": question if question else "You were mentioned.",
+            },
+        ]
+
+        # Tool-calling loop (max 3 rounds to prevent infinite loops)
+        reply_text = "Sorry, I couldn't process that."
+        response = None
+        for _ in range(3):
+            response = await client.chat.complete_async(
+                model="mistral-small-latest",
+                messages=messages,
+                tools=chat_tools,
+                temperature=0.4,
+                max_tokens=300,
+            )
+            choice = response.choices[0]
+
+            if choice.finish_reason == "tool_calls" or (choice.message.tool_calls and len(choice.message.tool_calls) > 0):
+                # Append assistant message with tool calls
+                messages.append(choice.message)
+                # Execute each tool call and append results
+                for tc in choice.message.tool_calls:
+                    fn_name = tc.function.name
+                    fn_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    logger.info("chat_mention: calling tool %s(%s)", fn_name, fn_args)
+                    tool_result = await _exec_tool(fn_name, fn_args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_result,
+                    })
+                continue  # Let the LLM process tool results
+
+            # No tool calls — we have the final text response
+            reply_text = (choice.message.content or "").strip()
+            break
+        else:
+            # All 3 rounds used tool calls — use whatever we got last
+            if response and response.choices:
+                reply_text = (response.choices[0].message.content or "").strip() or reply_text
+
     except Exception:
         logger.exception("Chat @beat LLM call failed")
         reply_text = "Sorry, I couldn't process that right now."
